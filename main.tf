@@ -69,6 +69,7 @@ data "aws_iam_policy_document" "default" {
       "ecs:*",
       "iam:PassRole",
       "logs:PutRetentionPolicy",
+      "logs:CreateLogGroup",
     ]
 
     resources = ["*"]
