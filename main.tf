@@ -1,35 +1,68 @@
-data "aws_caller_identity" "default" {}
+data "aws_caller_identity" "default" {
+}
 
-data "aws_region" "default" {}
+data "aws_region" "default" {
+}
 
-# Define composite variables for resources
-module "label" {
-  source     = "git::https://github.com/cloudposse/terraform-null-label.git?ref=tags/0.3.1"
-  namespace  = "${var.namespace}"
-  name       = "${var.name}"
-  stage      = "${var.stage}"
-  delimiter  = "${var.delimiter}"
-  attributes = "${var.attributes}"
-  tags       = "${var.tags}"
+locals {
+  enabled         = module.this.enabled
+  webhook_enabled = local.enabled && var.webhook_enabled ? true : false
+  webhook_count   = local.webhook_enabled ? 1 : 0
+  webhook_secret  = join("", random_password.webhook_secret.*.result)
+  webhook_url     = join("", aws_codepipeline_webhook.default.*.url)
 }
 
 resource "aws_s3_bucket" "default" {
-  bucket = "${module.label.id}"
-  acl    = "private"
-  tags   = "${module.label.tags}"
+  #bridgecrew:skip=BC_AWS_S3_13:Skipping `Enable S3 Bucket Logging` check until bridgecrew will support dynamic blocks (https://github.com/bridgecrewio/checkov/issues/776).
+  #bridgecrew:skip=BC_AWS_S3_14:Skipping `Ensure all data stored in the S3 bucket is securely encrypted at rest` check until bridgecrew will support dynamic blocks (https://github.com/bridgecrewio/checkov/issues/776).
+  #bridgecrew:skip=CKV_AWS_52:Skipping `Ensure S3 bucket has MFA delete enabled` due to issue in terraform (https://github.com/hashicorp/terraform-provider-aws/issues/629).
+  count         = local.enabled ? 1 : 0
+  bucket        = module.this.id
+  acl           = "private"
+  force_destroy = var.force_destroy
+  tags          = module.this.tags
+
+  versioning {
+    enabled = var.versioning_enabled
+  }
+
+  dynamic "logging" {
+    for_each = var.access_log_bucket_name != "" ? [1] : []
+    content {
+      target_bucket = var.access_log_bucket_name
+      target_prefix = "logs/${module.this.id}/"
+    }
+  }
+
+  dynamic "server_side_encryption_configuration" {
+    for_each = var.s3_bucket_encryption_enabled ? [1] : []
+
+    content {
+      rule {
+        apply_server_side_encryption_by_default {
+          sse_algorithm = "AES256"
+        }
+      }
+    }
+  }
+
 }
 
 resource "aws_iam_role" "default" {
-  name               = "${module.label.id}"
-  assume_role_policy = "${data.aws_iam_policy_document.assume.json}"
+  count              = local.enabled ? 1 : 0
+  name               = module.this.id
+  assume_role_policy = join("", data.aws_iam_policy_document.assume.*.json)
+  tags               = module.this.tags
 }
 
 data "aws_iam_policy_document" "assume" {
+  count = local.enabled ? 1 : 0
+
   statement {
     sid = ""
 
     actions = [
-      "sts:AssumeRole",
+      "sts:AssumeRole"
     ]
 
     principals {
@@ -42,16 +75,20 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role_policy_attachment" "default" {
-  role       = "${aws_iam_role.default.id}"
-  policy_arn = "${aws_iam_policy.default.arn}"
+  count      = local.enabled ? 1 : 0
+  role       = join("", aws_iam_role.default.*.id)
+  policy_arn = join("", aws_iam_policy.default.*.arn)
 }
 
 resource "aws_iam_policy" "default" {
-  name   = "${module.label.id}"
-  policy = "${data.aws_iam_policy_document.default.json}"
+  count  = local.enabled ? 1 : 0
+  name   = module.this.id
+  policy = join("", data.aws_iam_policy_document.default.*.json)
 }
 
 data "aws_iam_policy_document" "default" {
+  count = local.enabled ? 1 : 0
+
   statement {
     sid = ""
 
@@ -78,16 +115,25 @@ data "aws_iam_policy_document" "default" {
 }
 
 resource "aws_iam_role_policy_attachment" "s3" {
-  role       = "${aws_iam_role.default.id}"
-  policy_arn = "${aws_iam_policy.s3.arn}"
+  count      = local.enabled ? 1 : 0
+  role       = join("", aws_iam_role.default.*.id)
+  policy_arn = join("", aws_iam_policy.s3.*.arn)
 }
 
 resource "aws_iam_policy" "s3" {
-  name   = "${module.label.id}-s3"
-  policy = "${data.aws_iam_policy_document.s3.json}"
+  count  = local.enabled ? 1 : 0
+  name   = "${module.this.id}-s3"
+  policy = join("", data.aws_iam_policy_document.s3.*.json)
+}
+
+data "aws_s3_bucket" "website" {
+  count  = local.enabled && var.website_bucket_name != "" ? 1 : 0
+  bucket = var.website_bucket_name
 }
 
 data "aws_iam_policy_document" "s3" {
+  count = local.enabled ? 1 : 0
+
   statement {
     sid = ""
 
@@ -99,66 +145,93 @@ data "aws_iam_policy_document" "s3" {
     ]
 
     resources = [
-      "${aws_s3_bucket.default.arn}",
-      "${aws_s3_bucket.default.arn}/*",
-      "arn:aws:s3:::elasticbeanstalk*",
+      join("", aws_s3_bucket.default.*.arn),
+      "${join("", aws_s3_bucket.default.*.arn)}/*",
+      "arn:aws:s3:::elasticbeanstalk*"
     ]
 
     effect = "Allow"
   }
+
+  dynamic "statement" {
+    for_each = var.website_bucket_name != "" ? ["true"] : []
+    content {
+      sid = ""
+
+      actions = [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:GetBucketVersioning",
+        "s3:PutObject",
+        "s3:PutObjectAcl",
+      ]
+
+      resources = [
+        join("", data.aws_s3_bucket.website.*.arn),
+        "${join("", data.aws_s3_bucket.website.*.arn)}/*"
+      ]
+
+      effect = "Allow"
+    }
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "codebuild" {
-  role       = "${aws_iam_role.default.id}"
-  policy_arn = "${aws_iam_policy.codebuild.arn}"
+  count      = local.enabled ? 1 : 0
+  role       = join("", aws_iam_role.default.*.id)
+  policy_arn = join("", aws_iam_policy.codebuild.*.arn)
 }
 
 resource "aws_iam_policy" "codebuild" {
-  name   = "${module.label.id}-codebuild"
-  policy = "${data.aws_iam_policy_document.codebuild.json}"
+  count  = local.enabled ? 1 : 0
+  name   = "${module.this.id}-codebuild"
+  policy = join("", data.aws_iam_policy_document.codebuild.*.json)
 }
 
 data "aws_iam_policy_document" "codebuild" {
+  count = local.enabled ? 1 : 0
+
   statement {
     sid = ""
 
     actions = [
-      "codebuild:*",
+      "codebuild:*"
     ]
 
-    resources = ["${module.build.project_id}"]
+    resources = [module.codebuild.project_id]
     effect    = "Allow"
   }
 }
 
-module "build" {
-  source                = "git::https://github.com/cloudposse/terraform-aws-codebuild.git?ref=tags/0.9.0"
-  namespace             = "${var.namespace}"
-  name                  = "${var.name}"
-  stage                 = "${var.stage}"
-  build_image           = "${var.build_image}"
-  build_compute_type    = "${var.build_compute_type}"
-  buildspec             = "${var.buildspec}"
-  delimiter             = "${var.delimiter}"
-  attributes            = "${concat(var.attributes, list("build"))}"
-  tags                  = "${var.tags}"
-  privileged_mode       = "${var.privileged_mode}"
-  aws_region            = "${signum(length(var.aws_region)) == 1 ? var.aws_region : data.aws_region.default.name}"
-  aws_account_id        = "${signum(length(var.aws_account_id)) == 1 ? var.aws_account_id : data.aws_caller_identity.default.account_id}"
-  image_repo_name       = "${var.image_repo_name}"
-  image_tag             = "${var.image_tag}"
-  github_token          = "${var.github_oauth_token}"
-  environment_variables = "${var.environment_variables}"
+module "codebuild" {
+  source                      = "cloudposse/codebuild/aws"
+  version                     = "0.33.0"
+  build_image                 = var.build_image
+  build_compute_type          = var.build_compute_type
+  buildspec                   = var.buildspec
+  attributes                  = ["build"]
+  privileged_mode             = var.privileged_mode
+  aws_region                  = var.region != "" ? var.region : data.aws_region.default.name
+  aws_account_id              = var.aws_account_id != "" ? var.aws_account_id : data.aws_caller_identity.default.account_id
+  image_repo_name             = var.image_repo_name
+  image_tag                   = var.image_tag
+  github_token                = var.github_oauth_token
+  environment_variables       = var.environment_variables
+  cache_bucket_suffix_enabled = var.codebuild_cache_bucket_suffix_enabled
+  cache_type                  = var.cache_type
+
+  context = module.this.context
 }
 
 resource "aws_iam_role_policy_attachment" "codebuild_s3" {
-  role       = "${module.build.role_arn}"
-  policy_arn = "${aws_iam_policy.s3.arn}"
+  count      = local.enabled ? 1 : 0
+  role       = module.codebuild.role_id
+  policy_arn = join("", aws_iam_policy.s3.*.arn)
 }
 
 # Only one of the `aws_codepipeline` resources below will be created:
 
-# "source_build_deploy" will be created if `var.enabled` is set to `true` and the Elastic Beanstalk application name and environment name are specified
+# "source_build_deploy" will be created if `local.enabled` is set to `true` and the Elastic Beanstalk application name and environment name are specified
 
 # This is used in two use-cases:
 
@@ -166,20 +239,21 @@ resource "aws_iam_role_policy_attachment" "codebuild_s3" {
 
 # 2. GitHub -> ECR (Docker image) -> Elastic Beanstalk (running Docker stack)
 
-# "source_build" will be created if `var.enabled` is set to `true` and the Elastic Beanstalk application name or environment name are not specified
+# "source_build" will be created if `local.enabled` is set to `true` and the Elastic Beanstalk application name or environment name are not specified
 
 # This is used in this use-case:
 
 # 1. GitHub -> ECR (Docker image)
 
-resource "aws_codepipeline" "source_build_deploy" {
+resource "aws_codepipeline" "default" {
   # Elastic Beanstalk application name and environment name are specified
-  count    = "${var.enabled && signum(length(var.app)) == 1 && signum(length(var.env)) == 1 ? 1 : 0}"
-  name     = "${module.label.id}"
-  role_arn = "${aws_iam_role.default.arn}"
+  count    = local.enabled ? 1 : 0
+  name     = module.this.id
+  role_arn = join("", aws_iam_role.default.*.arn)
+  tags     = module.this.tags
 
   artifact_store {
-    location = "${aws_s3_bucket.default.bucket}"
+    location = join("", aws_s3_bucket.default.*.bucket)
     type     = "S3"
   }
 
@@ -194,12 +268,12 @@ resource "aws_codepipeline" "source_build_deploy" {
       version          = "1"
       output_artifacts = ["code"]
 
-      configuration {
-        OAuthToken           = "${var.github_oauth_token}"
-        Owner                = "${var.repo_owner}"
-        Repo                 = "${var.repo_name}"
-        Branch               = "${var.branch}"
-        PollForSourceChanges = "${var.poll_source_changes}"
+      configuration = {
+        OAuthToken           = var.github_oauth_token
+        Owner                = var.repo_owner
+        Repo                 = var.repo_name
+        Branch               = var.branch
+        PollForSourceChanges = var.poll_source_changes
       }
     }
   }
@@ -217,79 +291,93 @@ resource "aws_codepipeline" "source_build_deploy" {
       input_artifacts  = ["code"]
       output_artifacts = ["package"]
 
-      configuration {
-        ProjectName = "${module.build.project_name}"
+      configuration = {
+        ProjectName = module.codebuild.project_name
       }
     }
   }
 
-  stage {
-    name = "Deploy"
+  dynamic "stage" {
+    for_each = var.elastic_beanstalk_application_name != "" && var.elastic_beanstalk_environment_name != "" ? ["true"] : []
+    content {
+      name = "Deploy"
 
-    action {
-      name            = "Deploy"
-      category        = "Deploy"
-      owner           = "AWS"
-      provider        = "ElasticBeanstalk"
-      input_artifacts = ["package"]
-      version         = "1"
+      action {
+        name            = "Deploy"
+        category        = "Deploy"
+        owner           = "AWS"
+        provider        = "ElasticBeanstalk"
+        input_artifacts = ["package"]
+        version         = "1"
 
-      configuration {
-        ApplicationName = "${var.app}"
-        EnvironmentName = "${var.env}"
+        configuration = {
+          ApplicationName = var.elastic_beanstalk_application_name
+          EnvironmentName = var.elastic_beanstalk_environment_name
+        }
+      }
+    }
+  }
+
+  dynamic "stage" {
+    for_each = var.website_bucket_name != "" ? ["true"] : []
+    content {
+      name = "Deploy"
+
+      action {
+        name            = "Deploy"
+        category        = "Deploy"
+        owner           = "AWS"
+        provider        = "S3"
+        input_artifacts = ["package"]
+        version         = "1"
+
+        configuration = {
+          BucketName = var.website_bucket_name
+          Extract    = "true"
+          CannedACL  = var.website_bucket_acl
+        }
       }
     }
   }
 }
 
-resource "aws_codepipeline" "source_build" {
-  # Elastic Beanstalk application name or environment name are not specified
-  count    = "${var.enabled && (signum(length(var.app)) == 0 || signum(length(var.env)) == 0) ? 1 : 0}"
-  name     = "${module.label.id}"
-  role_arn = "${aws_iam_role.default.arn}"
+resource "random_password" "webhook_secret" {
+  count  = local.webhook_enabled ? 1 : 0
+  length = 32
 
-  artifact_store {
-    location = "${aws_s3_bucket.default.bucket}"
-    type     = "S3"
+  # Special characters are not allowed in webhook secret (AWS silently ignores webhook callbacks)
+  special = false
+}
+
+resource "aws_codepipeline_webhook" "default" {
+  count           = local.webhook_count
+  name            = module.this.id
+  authentication  = var.webhook_authentication
+  target_action   = var.webhook_target_action
+  target_pipeline = join("", aws_codepipeline.default.*.name)
+
+  authentication_configuration {
+    secret_token = local.webhook_secret
   }
 
-  stage {
-    name = "Source"
-
-    action {
-      name             = "Source"
-      category         = "Source"
-      owner            = "ThirdParty"
-      provider         = "GitHub"
-      version          = "1"
-      output_artifacts = ["code"]
-
-      configuration {
-        OAuthToken           = "${var.github_oauth_token}"
-        Owner                = "${var.repo_owner}"
-        Repo                 = "${var.repo_name}"
-        Branch               = "${var.branch}"
-        PollForSourceChanges = "${var.poll_source_changes}"
-      }
-    }
+  filter {
+    json_path    = var.webhook_filter_json_path
+    match_equals = var.webhook_filter_match_equals
   }
+}
 
-  stage {
-    name = "Build"
+module "github_webhook" {
+  source  = "cloudposse/repository-webhooks/github"
+  version = "0.12.0"
 
-    action {
-      name     = "Build"
-      category = "Build"
-      owner    = "AWS"
-      provider = "CodeBuild"
-      version  = "1"
+  enabled              = local.webhook_enabled
+  github_organization  = var.repo_owner
+  github_repositories  = [var.repo_name]
+  github_token         = var.github_webhooks_token
+  webhook_url          = local.webhook_url
+  webhook_secret       = local.webhook_secret
+  webhook_content_type = "json"
+  events               = var.github_webhook_events
 
-      input_artifacts  = ["code"]
-      output_artifacts = ["package"]
-
-      configuration {
-        ProjectName = "${module.build.project_name}"
-      }
-    }
-  }
+  context = module.this.context
 }
