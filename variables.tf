@@ -189,3 +189,9 @@ variable "website_bucket_acl" {
   default     = "public-read"
   description = "Canned ACL of the S3 bucket objects that get served as a website, can be private if using CloudFront with OAI"
 }
+
+variable "vpc_config" {
+  type        = any
+  default     = {}
+  description = "Configuration for the builds to run inside a VPC."
+}
