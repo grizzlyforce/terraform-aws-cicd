@@ -195,3 +195,10 @@ variable "vpc_config" {
   default     = {}
   description = "Configuration for the builds to run inside a VPC."
 }
+
+variable "cors_rules" {
+  type        = any
+  default     = {}
+  description = "Configuration for the s3 bucket to accept cors"
+}
+
